@@ -1,12 +1,11 @@
-// main.ts (v1.1 - 已修复语法错误)
+// main.ts (适配 Vercel Serverless)
 
 // 从 Deno 标准库导入必要的模块
 import { load } from "https://deno.land/std@0.224.0/dotenv/mod.ts";
 
 // --- 1. 配置模块 (等同于 app/core/config.py 和 .env) ---
 
-// 动态加载 .env 文件中的环境变量
-// 在启动时使用 `deno run --load` 标志是更现代的方式，但这里提供代码内加载作为备用
+// 动态加载 .env 文件中的环境变量（在 Vercel 上通常不会有 .env，没关系，这里是 no-op）
 await load({ export: true });
 
 const settings = {
@@ -97,7 +96,7 @@ class KimiAIProvider {
 
       console.log(`成功抓取到新的 nonce: ${nonce}`);
       return nonce;
-    } catch (error) {
+    } catch (error: any) {
       console.error(`抓取 nonce 失败: ${error.message}`);
       throw new Error(`无法从上游服务获取必要的动态参数: ${error.message}`);
     }
@@ -175,7 +174,7 @@ class KimiAIProvider {
         object: "model",
         created: Math.floor(Date.now() / 1000),
         owned_by: "lzA6",
-      })),
+      })), // 这里的 owned_by 维持原始行为
     };
     return new Response(JSON.stringify(modelData), {
       headers: { "Content-Type": "application/json" },
@@ -211,7 +210,7 @@ class KimiAIProvider {
     const requestId = `chatcmpl-${crypto.randomUUID()}`;
 
     const stream = new ReadableStream({
-      start: async (controller) => { // <--- 这里是修正的关键点
+      start: async (controller) => {
         const makeRequest = async (isRetry = false): Promise<string | null> => {
           try {
             const nonce = await this.getNonce(isRetry);
@@ -235,7 +234,7 @@ class KimiAIProvider {
               throw new Error(`上游请求失败: ${responseData.data || "未知错误"}`);
             }
             return responseData.data?.message || "";
-          } catch (error) {
+          } catch (error: any) {
             console.error(`请求上游服务时出错: ${error.message}`);
             if (!isRetry) {
               console.warn("尝试刷新 nonce 并重试...");
@@ -248,15 +247,19 @@ class KimiAIProvider {
         const assistantResponseContent = await makeRequest();
 
         if (assistantResponseContent === null) {
-            const errorChunk = createChatCompletionChunk(requestId, model, "重试后上游请求依然失败", "stop");
-            controller.enqueue(createSSEData(errorChunk));
-            controller.enqueue(DONE_CHUNK);
-            controller.close();
-            return;
+          const errorChunk = createChatCompletionChunk(requestId, model, "重试后上游请求依然失败", "stop");
+          controller.enqueue(createSSEData(errorChunk));
+          controller.enqueue(DONE_CHUNK);
+          controller.close();
+          return;
         }
 
+        // 如果是有状态模式，更新历史
+        // @ts-ignore
         if (sessionData) {
+          // @ts-ignore
           sessionData.messages.push(currentUserMessage);
+          // @ts-ignore
           sessionData.messages.push({ role: "assistant", content: assistantResponseContent });
           console.info(`会话 '${user}' 上下文已更新。`);
         }
@@ -285,14 +288,11 @@ class KimiAIProvider {
   }
 }
 
-
-// --- 4. HTTP 服务器与路由 (等同于 main.py 和 nginx.conf) ---
-
+// --- 4. 实例化 provider ---
 const provider = new KimiAIProvider();
 
-console.info(`${settings.APP_NAME} v${settings.APP_VERSION} 启动中...`);
-
-Deno.serve({ port: settings.PORT }, async (req: Request) => {
+// --- 5. 导出给 Vercel 的请求处理函数（关键） ---
+export async function handle(req: Request): Promise<Response> {
   const url = new URL(req.url);
   const pathname = url.pathname;
 
@@ -300,11 +300,17 @@ Deno.serve({ port: settings.PORT }, async (req: Request) => {
   if (settings.API_MASTER_KEY && settings.API_MASTER_KEY !== "1") {
     const authHeader = req.headers.get("Authorization");
     if (!authHeader || !authHeader.toLowerCase().startsWith("bearer ")) {
-      return new Response(JSON.stringify({ detail: "需要 Bearer Token 认证。" }), { status: 401 });
+      return new Response(JSON.stringify({ detail: "需要 Bearer Token 认证。" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      });
     }
     const token = authHeader.substring(7);
     if (token !== settings.API_MASTER_KEY) {
-      return new Response(JSON.stringify({ detail: "无效的 API Key。" }), { status: 403 });
+      return new Response(JSON.stringify({ detail: "无效的 API Key。" }), {
+        status: 403,
+        headers: { "Content-Type": "application/json" },
+      });
     }
   }
 
@@ -319,12 +325,20 @@ Deno.serve({ port: settings.PORT }, async (req: Request) => {
 
   if (pathname === "/" && req.method === "GET") {
     return new Response(
-        JSON.stringify({ message: `欢迎来到 ${settings.APP_NAME} v${settings.APP_VERSION}. 服务运行正常。` }),
-        { headers: { "Content-Type": "application/json" } }
+      JSON.stringify({ message: `欢迎来到 ${settings.APP_NAME} v${settings.APP_VERSION}. 服务运行正常。` }),
+      { headers: { "Content-Type": "application/json" } },
     );
   }
 
-  return new Response(JSON.stringify({ detail: "Not Found" }), { status: 404 });
-});
+  return new Response(JSON.stringify({ detail: "Not Found" }), {
+    status: 404,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
-console.info(`服务已启动，正在监听 http://localhost:${settings.PORT}`);
+// --- 6. 仅在“本地直接运行 main.ts”时监听端口（Vercel 不会走这里） ---
+if (import.meta.main) {
+  console.info(`${settings.APP_NAME} v${settings.APP_VERSION} 启动中...`);
+  Deno.serve({ port: settings.PORT }, handle);
+  console.info(`服务已启动，正在监听 http://localhost:${settings.PORT}`);
+}
