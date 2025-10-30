@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "api/**/*.[jt]s": { "runtime": "vercel-deno@3" }
+  },
+  "routes": [
+    { "src": "/v1/(.*)", "dest": "api/index.ts" },
+    { "src": "/(.*)", "dest": "api/index.ts" }
+  ]
+}
